@@ -469,6 +469,22 @@ section{padding:100px 40px;position:relative}
 .admin-mode-badge.active{opacity:1;transform:translateY(0) scale(1)}
 .settings-block{background:var(--card-bg);border:2px solid var(--border);border-radius:20px;padding:20px;margin-bottom:18px;box-shadow:4px 4px 0 var(--shadow-color)}
 .settings-block h4{font-family:var(--font-display);font-size:1.05rem;margin-bottom:14px}
+/* ═══════ CLOUD SYNC UI ═══════ */
+#cloudLoadingOverlay{position:fixed;inset:0;z-index:20000;background:var(--bg);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;transition:opacity .3s ease}
+#cloudLoadingOverlay.hidden{opacity:0;pointer-events:none}
+.cloud-spinner{width:46px;height:46px;border:5px solid var(--border);border-top-color:var(--caramel);border-radius:50%;animation:cloudspin 0.9s linear infinite}
+@keyframes cloudspin{to{transform:rotate(360deg);}}
+.cloud-loading-text{font-family:var(--font-display);font-weight:600;color:var(--text-muted)}
+.cloud-error-box{max-width:420px;text-align:center;padding:28px 26px;background:var(--card-bg);border:3px solid var(--border);border-radius:22px;box-shadow:6px 6px 0 var(--shadow-color)}
+.cloud-error-box h3{font-family:var(--font-display);margin-bottom:10px;color:#C62828}
+.cloud-error-box p{color:var(--text-muted);font-size:.92rem;margin-bottom:16px;line-height:1.5}
+.cloud-retry-btn{background:var(--caramel);color:#fff;border:2px solid var(--espresso);border-radius:12px;padding:10px 22px;font-family:var(--font-display);font-weight:700;cursor:pointer;box-shadow:4px 4px 0 var(--shadow-color)}
+.save-status{position:fixed;bottom:24px;right:24px;z-index:15000;background:var(--card-bg);border:2px solid var(--border);border-radius:14px;padding:10px 18px;font-size:.85rem;font-weight:600;box-shadow:4px 4px 0 var(--shadow-color);display:flex;align-items:center;gap:8px;transform:translateY(20px);opacity:0;transition:all .3s ease;pointer-events:none}
+.save-status.show{transform:translateY(0);opacity:1}
+.save-status.ok{color:#2E7D32;border-color:#2E7D32}
+.save-status.err{color:#C62828;border-color:#C62828}
+.save-status .ss-dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0}
+.save-status.busy .ss-dot{animation:pulse 1s ease-in-out infinite}
 .rr-row{display:flex;align-items:center;gap:10px;background:var(--bg);border:2px solid var(--border);border-radius:14px;padding:10px 12px;margin-bottom:9px}
 .rr-info{flex:1;min-width:0}
 .rr-info h5{font-family:var(--font-display);font-size:.9rem;font-weight:700;margin:0 0 3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -550,8 +566,14 @@ section{padding:60px 20px}
 .footer-logo{justify-content:center}
 }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 </head>
 <body>
+<div id="cloudLoadingOverlay">
+  <div class="cloud-spinner"></div>
+  <div class="cloud-loading-text" id="cloudLoadingText">Memuat data terbaru...</div>
+</div>
+<div class="save-status" id="saveStatus"><span class="ss-dot"></span><span id="saveStatusText">Menyimpan...</span></div>
 
 <!-- ═══════ NAVBAR ═══════ -->
 <nav class="navbar">
@@ -1102,14 +1124,134 @@ section{padding:60px 20px}
 (function(){
 'use strict';
 
-/* ═══════ STORAGE HELPERS ═══════ */
+/* ═══════ SUPABASE CONFIG ═══════
+   Isi 3 nilai ini sesuai panduan supabase_setup/02_SETUP_GUIDE.md
+   sebelum deploy. anon key AMAN dipakai di frontend — akses nyata
+   dibatasi oleh Row Level Security di database, bukan oleh key ini. */
+var SUPABASE_URL = 'https://eywrxncmytpyaxnzwwuq.supabase.co';
+var SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV1d3J4bmNteXRweWF4bnp3d3VxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk0NTczOTMsImV4cCI6MjEwNTAzMzM5M30.sh9Qk8ybjEdj1R9DH01OOqLpXmjXtdsHJr_smpYWAR8';
+var ADMIN_EMAIL = 'admin@bakedbyhagia.com';
+var STORAGE_BUCKET = 'site-images';
+
+/* ═══════ STORAGE HELPERS (khusus preferensi UI, BUKAN data konten) ═══════ */
 var LS={
   get:function(k,d){try{var v=localStorage.getItem(k);return v?JSON.parse(v):d;}catch(e){return d;}},
   set:function(k,v){try{localStorage.setItem(k,JSON.stringify(v));return true;}catch(e){return false;}}
 };
+
+/* ═══════ DB — Supabase data-access layer ═══════
+   Semua data utama website (produk, event, testimoni, partner, rating,
+   settings, transaksi) dibaca/ditulis lewat sini ke database online. */
+var supabaseClient=null;
+var DB={
+  ready:false,
+  configured:function(){
+    return SUPABASE_URL && SUPABASE_URL.indexOf('GANTI_DENGAN')===-1 &&
+           SUPABASE_ANON_KEY && SUPABASE_ANON_KEY.indexOf('GANTI_DENGAN')===-1;
+  },
+  init:function(){
+    if(!this.configured()){
+      console.error('Supabase belum dikonfigurasi. Isi SUPABASE_URL & SUPABASE_ANON_KEY di bagian atas <script>.');
+      return false;
+    }
+    if(!window.supabase){console.error('Supabase SDK gagal dimuat.');return false;}
+    supabaseClient=window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    this.ready=true;
+    return true;
+  },
+  fetchAll:function(table,orderCol){
+    var q=supabaseClient.from(table).select('*');
+    if(orderCol)q=q.order(orderCol,{ascending:true});
+    return q.then(function(res){if(res.error)throw res.error;return res.data||[];});
+  },
+  insertRow:function(table,row){
+    return supabaseClient.from(table).insert(row).select().maybeSingle().then(function(res){
+      if(res.error)throw res.error;return res.data;
+    });
+  },
+  updateRow:function(table,id,patch){
+    return supabaseClient.from(table).update(patch).eq('id',id).select().maybeSingle().then(function(res){
+      if(res.error)throw res.error;return res.data;
+    });
+  },
+  removeRow:function(table,id){
+    return supabaseClient.from(table).delete().eq('id',id).then(function(res){
+      if(res.error)throw res.error;return true;
+    });
+  },
+  removeWhere:function(table,col,val){
+    return supabaseClient.from(table).delete().eq(col,val).then(function(res){
+      if(res.error)throw res.error;return true;
+    });
+  },
+  getSettings:function(){
+    return supabaseClient.from('site_settings').select('*').eq('id',1).maybeSingle().then(function(res){
+      if(res.error)throw res.error;return res.data;
+    });
+  },
+  updateSettings:function(patch){
+    patch=Object.assign({},patch,{updated_at:new Date().toISOString()});
+    return supabaseClient.from('site_settings').update(patch).eq('id',1).select().maybeSingle().then(function(res){
+      if(res.error)throw res.error;return res.data;
+    });
+  },
+  uploadImage:function(file,folder){
+    if(!file)return Promise.resolve(null);
+    var ext=(file.name&&file.name.indexOf('.')>-1)?file.name.split('.').pop():'jpg';
+    var path=(folder||'misc')+'/'+Date.now()+'-'+Math.random().toString(36).slice(2,8)+'.'+ext;
+    return supabaseClient.storage.from(STORAGE_BUCKET).upload(path,file,{cacheControl:'3600',upsert:false}).then(function(up){
+      if(up.error)throw up.error;
+      var pub=supabaseClient.storage.from(STORAGE_BUCKET).getPublicUrl(path);
+      return pub.data.publicUrl;
+    });
+  },
+  signIn:function(password){
+    return supabaseClient.auth.signInWithPassword({email:ADMIN_EMAIL,password:password}).then(function(res){
+      if(res.error)throw res.error;return res.data.session;
+    });
+  },
+  signOut:function(){return supabaseClient.auth.signOut();},
+  getSession:function(){
+    return supabaseClient.auth.getSession().then(function(res){return res.data?res.data.session:null;});
+  }
+};
 function formatRupiah(n){n=parseInt(n,10);if(isNaN(n))n=0;return 'Rp '+n.toLocaleString('id-ID');}
 function escapeHtml(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function getProductById(pid){for(var i=0;i<products.length;i++){if(products[i].id===pid)return products[i];}return null;}
+
+/* ═══════ CLOUD UI HELPERS ═══════ */
+var saveStatusTimer=null;
+function showSaveStatus(state,text){
+  var el=document.getElementById('saveStatus'),txt=document.getElementById('saveStatusText');
+  el.className='save-status show '+(state==='busy'?'busy':state==='ok'?'ok':state==='err'?'err':'');
+  txt.textContent=text;
+  if(saveStatusTimer)clearTimeout(saveStatusTimer);
+  if(state!=='busy'){saveStatusTimer=setTimeout(function(){el.classList.remove('show');},state==='err'?4000:1800);}
+}
+function hideCloudLoading(){
+  var ov=document.getElementById('cloudLoadingOverlay');
+  if(ov)ov.classList.add('hidden');
+}
+function showCloudError(message,retryFn){
+  var ov=document.getElementById('cloudLoadingOverlay');
+  if(!ov)return;
+  ov.classList.remove('hidden');
+  ov.innerHTML='<div class="cloud-error-box"><h3>⚠️ Gagal Memuat Data</h3><p>'+escapeHtml(message)+'</p>'+
+    '<button type="button" class="cloud-retry-btn" id="cloudRetryBtn">Coba Lagi</button></div>';
+  document.getElementById('cloudRetryBtn').addEventListener('click',retryFn);
+}
+/* wraps an admin write action: shows Menyimpan.../Tersimpan/Gagal automatically */
+function withSaveStatus(promise, busyText, okText){
+  showSaveStatus('busy', busyText||'Menyimpan...');
+  return promise.then(function(res){
+    showSaveStatus('ok', okText||'Tersimpan ke database!');
+    return res;
+  }).catch(function(err){
+    console.error(err);
+    showSaveStatus('err', 'Gagal menyimpan: '+(err&&err.message?err.message:'periksa koneksi'));
+    throw err;
+  });
+}
 
 /* ═══════ CONSTANTS ═══════ */
 var CATEGORIES=[
@@ -1124,61 +1266,69 @@ var HINT_SVG='<svg viewBox="0 0 24 24" fill="none" stroke-width="2.5" stroke-lin
 function starSvg(cls){return '<svg viewBox="0 0 24 24" class="'+(cls||'')+'"><path d="M12 2l2.94 6.36 6.96.6-5.28 4.56 1.6 6.78L12 16.9 5.78 20.3l1.6-6.78-5-4.36 6.6-.6L12 2z"/></svg>';}
 function starsRow(n,size){var h='<span class="stars-display" style="--star-size:'+(size||18)+'px">';for(var i=1;i<=5;i++){h+=starSvg(i<=n?'star-on':'star-off');}return h+'</span>';}
 
-/* ═══════ DEFAULT DATA ═══════ */
-var DEFAULT_PRODUCTS=[
-  {id:'p1',name:'Bolu Pandan',category:'cake',price:formatRupiah(85000),rawPrice:'85000',emoji:'🍰',
-   desc:'Bolu pandan lembut wangi dengan santan segar dan taburan keju di atasnya.',
-   longDesc:'Bolu pandan legendaris kami — diaduk dengan santan asli dan pasta pandan pilihan, dipanggang perlahan hingga mengembang sempurna. Lembut di setiap potongan, cocok untuk acara keluarga maupun hampers.',
-   sizeInfo:'Ukuran 20x20 cm',variants:[{name:'20x20 cm',price:'85000'},{name:'22x22 cm',price:'95000'}],tag:'Best Seller',tagColor:'#C89F7C',image:null},
-  {id:'p2',name:'Brownies Panggang',category:'cake',price:formatRupiah(75000),rawPrice:'75000',emoji:'🍫',
-   desc:'Brownies fudgy dengan dark chocolate premium, topping almond slice.',
-   longDesc:'Brownies panggang dengan tekstur fudgy di dalam dan crust tipis di luar. Memakai dark chocolate couverture 70% dan mentega premium, di atasnya taburan almond slice panggang.',
-   sizeInfo:'Loyang 20x20 cm (±16 potong)',variants:[],tag:'Fav',tagColor:'#8B5E3C',image:null},
-  {id:'p3',name:'Basque Burnt Cheesecake',category:'cake',price:formatRupiah(95000),rawPrice:'95000',emoji:'🧀',
-   desc:'Cheesecake karamelized di luar, lumer creamy di dalam. Legend!',
-   longDesc:'Cheesecake ala Basque yang dipanggang bersuhu tinggi hingga permukaannya karamelized dan aromatic. Bagian dalamnya tetap lumer dan creamy — favorit yang selalu habis.',
-   sizeInfo:'Diameter 16 cm',variants:[],tag:'',tagColor:'#C89F7C',image:null},
-  {id:'p4',name:'Cookies Choco Chip',category:'cookies',price:formatRupiah(65000),rawPrice:'65000',emoji:'🍪',
-   desc:'Cookies renyah di luar, chewy di dalam, penuh choco chip melimpah.',
-   longDesc:'Choco chip cookies dengan resep klasik — renyah di pinggir, chewy di tengah, dan choco chipnya benar-benar melimpah di setiap gigitan. Isi toples 500g, cocok untuk stok camilan keluarga.',
-   sizeInfo:'Toples 500g',variants:[{name:'Toples 500g',price:'65000'},{name:'Toples 1kg',price:'120000'}],tag:'Best Seller',tagColor:'#D4A017',image:null},
-  {id:'p5',name:'Kastengel Premium',category:'cookies',price:formatRupiah(78000),rawPrice:'78000',emoji:'🧀',
-   desc:'Kastengel gurih dengan edam & cheddar premium, renyah dan lumer.',
-   longDesc:'Kastengel dengan perpaduan keju edam dan cheddar premium, adonan ringan yang renyah dan lumer di mulut. Dipanggang hingga golden sempurna — wajib ada saat lebaran maupun hampers.',
-   sizeInfo:'Toples 500g',variants:[],tag:'',tagColor:'#C89F7C',image:null},
-  {id:'p6',name:'Nastar Klasik',category:'cookies',price:formatRupiah(72000),rawPrice:'72000',emoji:'🍍',
-   desc:'Nastar lumer dengan selai nanas homemade asam manis segar.',
-   longDesc:'Nastar klasik dengan selai nanas homemade yang dimasak perlahan hingga teksturnya thick dan rasa asam-manisnya seimbang. Kulitnya lumer, topping keju parut melimpah.',
-   sizeInfo:'Toples 500g',variants:[],tag:'New!',tagColor:'#C62828',image:null},
-  {id:'p7',name:'Donat Kentang',category:'snack',price:formatRupiah(50000),rawPrice:'50000',emoji:'🍩',
-   desc:'Donat kentang super lembut, isi 6 pcs — topping bisa pilih.',
-   longDesc:'Donat kentang yang lembutnya tahan lama karena adonan diuleni hingga windowpane. Tersedia topping gula halus, glaze coklat, dan keju. Isi 6 pcs per box.',
-   sizeInfo:'Isi 6 pcs per box',variants:[{name:'Gula Halus',price:'50000'},{name:'Glaze Coklat',price:'55000'},{name:'Keju',price:'58000'}],tag:'',tagColor:'#C89F7C',image:null},
-  {id:'p8',name:'Banana Roll Cake',category:'snack',price:formatRupiah(55000),rawPrice:'55000',emoji:'🍌',
-   desc:'Roll cake pisang lembut dengan cream cheese frosting.',
-   longDesc:'Roll cake beraroma pisang raja yang lembut, digulung dengan cream cheese frosting yang creamy dan sedikit asam. Tidak terlalu manis — pas untuk teman ngopi atau teh.',
-   sizeInfo:'Diameter 22 cm',variants:[],tag:'Fav',tagColor:'#E8A87C',image:null},
-  {id:'p9',name:'Risoles Mayo',category:'snack',price:formatRupiah(48000),rawPrice:'48000',emoji:'🥟',
-   desc:'Risoles isi ragout ayam telur mayo, kulit garing isi creamy.',
-   longDesc:'Risoles kulit garing berisi ragout ayam creamy dengan potongan telur dan mayo, dibalur tepung roti dan digoreng hingga golden. Frozen-friendly — tinggal goreng kapan saja.',
-   sizeInfo:'Isi 10 pcs (frozen)',variants:[],tag:'New!',tagColor:'#2E7D32',image:null}
-];
 
-/* ═══════ STATE ═══════ */
-var products=LS.get('hagia_products',null);
-if(!products||!products.length){products=JSON.parse(JSON.stringify(DEFAULT_PRODUCTS));LS.set('hagia_products',products);}
-var menuRatings=LS.get('hagia_ratings',{});
-var testimonials=LS.get('hagia_testimonials',[
-  {id:'t1',name:'Dina',role:'Pelanggan',stars:5,text:'Bolu pandannya lembut banget, wangi pandannya kerasa! Pasti repeat order.',date:'2026-08-02'},
-  {id:'t2',name:'Raka',role:'Pelanggan',stars:5,text:'Kastengel-nya renyah dan gurih, nggak bikin eneg. Hampersnya juga cantik.',date:'2026-08-11'},
-  {id:'t3',name:'Sinta',role:'Pelanggan',stars:4,text:'Cookies choco chip-nya chewy di dalam, anak-anak di rumah suka banget.',date:'2026-08-19'}
-]);
-var finance=LS.get('hagia_finance',[]);
-var events=LS.get('hagia_events',[]);
-var partnersData=LS.get('hagia_partners',{show:true,label:'✦ Terima Kasih ✦',title:'Kolaborasi & Sponsor',sub:'',size:'md',group:'type',grayscale:true,items:[]});
-var aboutData=LS.get('hagia_about',null);
-var socialData=LS.get('hagia_social',{instagram:'',whatsapp:'',tiktok:'',facebook:'',twitter:''});
-var waNumber=LS.get('hagia_wa_number','6281234567890');
+
+/* ═══════ STATE (populated from Supabase by bootstrapApp, see bottom of file) ═══════ */
+var products=[];
+var menuRatings={};
+var testimonials=[];
+var finance=[];
+var events=[];
+var partnersData={show:true,label:'✦ Terima Kasih ✦',title:'Kolaborasi & Sponsor',sub:'',size:'md',group:'type',grayscale:true,items:[]};
+var aboutData=null;
+var socialData={instagram:'',whatsapp:'',tiktok:'',facebook:'',twitter:''};
+var waNumber='6281234567890';
+
+/* ═══════ DB ROW <-> JS OBJECT MAPPERS ═══════
+   Tabel Supabase pakai snake_case; kode UI di seluruh file ini memakai
+   camelCase seperti semula supaya tidak perlu mengubah logic render. */
+function rowToProduct(r){
+  return {id:r.id,name:r.name,category:r.category,rawPrice:r.raw_price,price:formatRupiah(r.raw_price),
+    emoji:r.emoji,desc:r.description,longDesc:r.long_desc,sizeInfo:r.size_info,
+    variants:r.variants||[],tag:r.tag||'',tagColor:r.tag_color||'',image:r.image||null,
+    sortOrder:r.sort_order||0};
+}
+function productToRow(p){
+  return {name:p.name,category:p.category,raw_price:String(p.rawPrice||'0'),emoji:p.emoji||'🍪',
+    description:p.desc||'',long_desc:p.longDesc||'',size_info:p.sizeInfo||'',
+    variants:p.variants||[],tag:p.tag||'',tag_color:p.tagColor||'',image:p.image||null,
+    sort_order:p.sortOrder||0};
+}
+function rowToEvent(r){
+  return {id:r.id,title:r.title,desc:r.description,image:r.image,
+    start:r.start_at?toLocalDatetimeInput(r.start_at):'',target:r.end_at?toLocalDatetimeInput(r.end_at):'',
+    ratio:r.ratio,size:r.size,layout:r.layout,dateMode:r.date_mode,showCd:r.show_cd,
+    cdTitle:r.cd_title,cdUnits:r.cd_units,endedText:r.ended_text,badge:r.badge,accent:r.accent,
+    ctaText:r.cta_text,ctaUrl:r.cta_url,active:r.active,autoHide:r.auto_hide,sortOrder:r.sort_order||0};
+}
+function eventToRow(e){
+  return {title:e.title,description:e.desc||'',image:e.image||null,
+    start_at:e.start?new Date(e.start).toISOString():null,end_at:e.target?new Date(e.target).toISOString():null,
+    ratio:e.ratio,size:e.size,layout:e.layout,date_mode:e.dateMode,show_cd:!!e.showCd,
+    cd_title:e.cdTitle||'',cd_units:e.cdUnits,ended_text:e.endedText||'🎉 Event telah berakhir',
+    badge:e.badge||'',accent:e.accent||'#D4A017',cta_text:e.ctaText||'',cta_url:e.ctaUrl||'',
+    active:!!e.active,auto_hide:!!e.autoHide,sort_order:e.sortOrder||0};
+}
+function toLocalDatetimeInput(iso){
+  var d=new Date(iso);if(isNaN(d.getTime()))return '';
+  var p2=function(n){return n<10?'0'+n:''+n;};
+  return d.getFullYear()+'-'+p2(d.getMonth()+1)+'-'+p2(d.getDate())+'T'+p2(d.getHours())+':'+p2(d.getMinutes());
+}
+function rowToTestimonial(r){
+  return {id:r.id,name:r.name,role:r.role||'Pelanggan',stars:r.stars,text:r.body||'',image:r.image||null,date:r.review_date};
+}
+function testimonialToRow(t){
+  return {name:t.name,role:t.role||'Pelanggan',stars:t.stars,body:t.text||'',image:t.image||null,review_date:t.date};
+}
+function rowToPartner(r){
+  return {id:r.id,name:r.name,type:r.type,logo:r.logo||null,note:r.note||'',url:r.url||'',active:r.active,sortOrder:r.sort_order||0};
+}
+function partnerToRow(p){
+  return {name:p.name,type:p.type||'Partner',logo:p.logo||null,note:p.note||'',url:p.url||'',active:!!p.active,sort_order:p.sortOrder||0};
+}
+function rowToTransaction(r){
+  return {id:r.id,date:r.txn_date,desc:r.description,type:r.type,amount:r.amount};
+}
 
 /* ═══════ THEME ═══════ */
 var themeToggle=document.getElementById('themeToggle');
@@ -1223,12 +1373,13 @@ function bindStarButtons(){
     btns[i].onclick=function(e){
       e.stopPropagation();
       var pid=this.getAttribute('data-rate-pid'),stars=parseInt(this.getAttribute('data-stars'),10);
-      if(!menuRatings[pid])menuRatings[pid]=[];
-      menuRatings[pid].push({stars:stars,ts:Date.now()});
-      LS.set('hagia_ratings',menuRatings);
-      refreshRating(pid);
       var card=this.closest('.menu-card');
-      if(card){card.style.animation='wiggle .4s ease';setTimeout(function(){card.style.animation='';},420);}
+      DB.insertRow('ratings',{product_id:pid,stars:stars}).then(function(row){
+        if(!menuRatings[pid])menuRatings[pid]=[];
+        menuRatings[pid].push({stars:stars,ts:row&&row.created_at?new Date(row.created_at).getTime():Date.now()});
+        refreshRating(pid);
+        if(card){card.style.animation='wiggle .4s ease';setTimeout(function(){card.style.animation='';},420);}
+      }).catch(function(err){console.error(err);});
     };
   }
 }
@@ -1450,13 +1601,11 @@ function renderReviewStars(){
   }
 }
 renderReviewStars();
-var reviewImageData=null;
+var reviewImageFile=null;
 document.getElementById('reviewImageInput').addEventListener('change',function(){
   var file=this.files[0];if(!file)return;
-  processImageFile(file,function(dataUrl){
-    reviewImageData=dataUrl;
-    document.getElementById('reviewImageUpload').classList.add('has-image');
-  });
+  reviewImageFile=file;
+  document.getElementById('reviewImageUpload').classList.add('has-image');
 });
 document.getElementById('reviewForm').addEventListener('submit',function(e){
   e.preventDefault();
@@ -1464,16 +1613,29 @@ document.getElementById('reviewForm').addEventListener('submit',function(e){
   if(!name||!text)return;
   var now=new Date();
   var date=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
-  testimonials.push({id:'t'+Date.now(),name:name,role:'Pelanggan',stars:reviewStarsVal,text:text,date:date,image:reviewImageData});
-  LS.set('hagia_testimonials',testimonials);
-  renderTestimonials();
-  this.reset();reviewStarsVal=5;renderReviewStars();
-  reviewImageData=null;document.getElementById('reviewImageUpload').classList.remove('has-image');
-  flashSaved('reviewSavedNote');
+  var formEl=this;
+  showSaveStatus('busy','Mengirim ulasan...');
+  (reviewImageFile?DB.uploadImage(reviewImageFile,'testimonials'):Promise.resolve(null)).then(function(imgUrl){
+    var id='t'+Date.now();
+    var row=Object.assign({id:id},testimonialToRow({name:name,role:'Pelanggan',stars:reviewStarsVal,text:text,date:date,image:imgUrl}));
+    return DB.insertRow('testimonials',row);
+  }).then(function(){
+    return DB.fetchAll('testimonials','created_at');
+  }).then(function(rows){
+    testimonials=rows.map(rowToTestimonial);
+    renderTestimonials();
+    if(typeof renderAdminTestimonials==='function')renderAdminTestimonials();
+    formEl.reset();reviewStarsVal=5;renderReviewStars();
+    reviewImageFile=null;document.getElementById('reviewImageUpload').classList.remove('has-image');
+    showSaveStatus('ok','Terima kasih atas ulasannya!');
+    flashSaved('reviewSavedNote');
+  }).catch(function(err){
+    console.error(err);
+    showSaveStatus('err','Gagal mengirim ulasan: '+(err&&err.message?err.message:'periksa koneksi'));
+  });
 });
 
 /* ═══════ EVENTS & PROMO ═══════ */
-function saveEvents(){LS.set('hagia_events',events);}
 function pad2(n){return n<10?'0'+n:''+n;}
 function countdownParts(target){
   var diff=new Date(target).getTime()-Date.now();
@@ -1619,7 +1781,6 @@ setInterval(function(){
   if(k!==evVisKey){evVisKey=k;renderEvents();if(typeof renderAdminEvents==='function')renderAdminEvents();return;}
   updateCountdowns();
 },1000);
-renderEvents();
 
 /* admin: CRUD event/promo */
 var evImageData=null,evEditId=null;
@@ -1636,8 +1797,13 @@ function evSetPreview(dataUrl){
 }
 $e('evImageInput').addEventListener('change',function(){
   var file=this.files[0];if(!file)return;
-  processImageFile(file,function(dataUrl){
-    evImageData=dataUrl;evSetPreview(dataUrl);
+  showSaveStatus('busy','Mengupload gambar...');
+  DB.uploadImage(file,'events').then(function(url){
+    evImageData=url;evSetPreview(url);
+    showSaveStatus('ok','Gambar terupload.');
+  }).catch(function(err){
+    console.error(err);
+    showSaveStatus('err','Upload gambar gagal: '+(err&&err.message?err.message:'periksa koneksi'));
   });
   this.value='';
 });
@@ -1705,14 +1871,22 @@ $e('evSubmitBtn').addEventListener('click',function(){
     alert('Tanggal mulai harus lebih awal dari tanggal berakhir.');return;
   }
   if(evEditId){
-    for(var i=0;i<events.length;i++){
-      if(events[i].id===evEditId){data.id=evEditId;events[i]=data;break;}
-    }
+    data.id=evEditId;
+    var existing=null;for(var i=0;i<events.length;i++){if(events[i].id===evEditId)existing=events[i];}
+    data.sortOrder=existing?existing.sortOrder:0;
+    withSaveStatus(DB.updateRow('events',evEditId,eventToRow(data)),'Menyimpan...','Event diperbarui!').then(function(){
+      for(var j=0;j<events.length;j++){if(events[j].id===evEditId){events[j]=data;break;}}
+      renderEvents();renderAdminEvents();resetEventForm();
+      flashSaved('evSavedNote');
+    }).catch(function(){});
   }else{
-    data.id='ev'+Date.now();events.push(data);
+    data.id='ev'+Date.now();data.sortOrder=events.length;
+    withSaveStatus(DB.insertRow('events',Object.assign({id:data.id},eventToRow(data))),'Menyimpan...','Event tersimpan!').then(function(){
+      events.push(data);
+      renderEvents();renderAdminEvents();resetEventForm();
+      flashSaved('evSavedNote');
+    }).catch(function(){});
   }
-  saveEvents();renderEvents();renderAdminEvents();resetEventForm();
-  flashSaved('evSavedNote');
 });
 $e('evCancelBtn').addEventListener('click',resetEventForm);
 /* live preview: ubah setting langsung tampil saat mode edit */
@@ -1739,7 +1913,13 @@ function evMove(eid,dir){
     if(events[i].id===eid){
       var j=i+dir;if(j<0||j>=events.length)return;
       var tmp=events[i];events[i]=events[j];events[j]=tmp;
-      saveEvents();renderEvents();renderAdminEvents();return;
+      events[i].sortOrder=i;events[j].sortOrder=j;
+      renderEvents();renderAdminEvents();
+      withSaveStatus(Promise.all([
+        DB.updateRow('events',events[i].id,{sort_order:i}),
+        DB.updateRow('events',events[j].id,{sort_order:j})
+      ]),'Menyimpan urutan...','Urutan tersimpan.').catch(function(){});
+      return;
     }
   }
 }
@@ -1771,11 +1951,12 @@ function renderAdminEvents(){
   each('.ev-up',function(){evMove(this.getAttribute('data-eid'),-1);});
   each('.ev-down',function(){evMove(this.getAttribute('data-eid'),1);});
   each('.ev-toggle',function(){
-    var eid=this.getAttribute('data-eid');
+    var eid=this.getAttribute('data-eid'),newActive=null;
     for(var x=0;x<events.length;x++){
-      if(events[x].id===eid){var n=evNorm(events[x]);n.active=!n.active;events[x]=n;break;}
+      if(events[x].id===eid){var n=evNorm(events[x]);n.active=!n.active;events[x]=n;newActive=n.active;break;}
     }
-    saveEvents();renderEvents();renderAdminEvents();
+    renderEvents();renderAdminEvents();
+    withSaveStatus(DB.updateRow('events',eid,{active:newActive}),'Menyimpan...','Status event diperbarui.').catch(function(){});
   });
   each('.ev-edit',function(){
     var eid=this.getAttribute('data-eid');
@@ -1796,16 +1977,17 @@ function renderAdminEvents(){
     var eid=this.getAttribute('data-eid'),name='';
     for(var y=0;y<events.length;y++){if(events[y].id===eid)name=events[y].title;}
     if(!confirm('Hapus event "'+name+'"? Tindakan ini tidak bisa dibatalkan.'))return;
-    var next=[];
-    for(var x=0;x<events.length;x++){if(events[x].id!==eid)next.push(events[x]);}
-    events=next;
-    if(evEditId===eid)resetEventForm();
-    saveEvents();renderEvents();renderAdminEvents();
+    withSaveStatus(DB.removeRow('events',eid),'Menghapus...','Event dihapus.').then(function(){
+      var next=[];
+      for(var x=0;x<events.length;x++){if(events[x].id!==eid)next.push(events[x]);}
+      events=next;
+      if(evEditId===eid)resetEventForm();
+      renderEvents();renderAdminEvents();
+    }).catch(function(){});
   });
 }
 
 /* ═══════ KOLABORASI & SPONSOR ═══════ */
-function savePartners(){LS.set('hagia_partners',partnersData);}
 function ptInitials(name){
   var parts=String(name||'?').trim().split(/\s+/),out='';
   for(var i=0;i<parts.length&&out.length<2;i++){if(parts[i])out+=parts[i].charAt(0);}
@@ -1866,7 +2048,6 @@ function renderPartners(){
   }
   observeReveals();
 }
-renderPartners();
 
 /* admin: CRUD partner */
 var ptImageData=null,ptEditId=null;
@@ -1877,7 +2058,14 @@ function ptSetPreview(url){
 }
 document.getElementById('ptImageInput').addEventListener('change',function(){
   var f=this.files[0];if(!f)return;
-  processImageFile(f,function(d){ptImageData=d;ptSetPreview(d);});
+  showSaveStatus('busy','Mengupload logo...');
+  DB.uploadImage(f,'partners').then(function(url){
+    ptImageData=url;ptSetPreview(url);
+    showSaveStatus('ok','Logo terupload.');
+  }).catch(function(err){
+    console.error(err);
+    showSaveStatus('err','Upload logo gagal: '+(err&&err.message?err.message:'periksa koneksi'));
+  });
   this.value='';
 });
 document.getElementById('ptImageRemove').addEventListener('click',function(e){
@@ -1907,12 +2095,21 @@ document.getElementById('ptSubmitBtn').addEventListener('click',function(){
     active:document.getElementById('ptActive').checked
   };
   if(ptEditId){
-    for(var i=0;i<partnersData.items.length;i++){if(partnersData.items[i].id===ptEditId){partnersData.items[i]=data;break;}}
+    var existing=null;for(var i=0;i<partnersData.items.length;i++){if(partnersData.items[i].id===ptEditId)existing=partnersData.items[i];}
+    data.sortOrder=existing?existing.sortOrder:0;
+    withSaveStatus(DB.updateRow('partners',ptEditId,partnerToRow(data)),'Menyimpan...','Partner diperbarui!').then(function(){
+      for(var j=0;j<partnersData.items.length;j++){if(partnersData.items[j].id===ptEditId){partnersData.items[j]=data;break;}}
+      renderPartners();renderAdminPartners();resetPartnerForm();
+      flashSaved('ptSavedNote');
+    }).catch(function(){});
   }else{
-    partnersData.items.push(data);
+    data.sortOrder=partnersData.items.length;
+    withSaveStatus(DB.insertRow('partners',Object.assign({id:data.id},partnerToRow(data))),'Menyimpan...','Partner tersimpan!').then(function(){
+      partnersData.items.push(data);
+      renderPartners();renderAdminPartners();resetPartnerForm();
+      flashSaved('ptSavedNote');
+    }).catch(function(){});
   }
-  savePartners();renderPartners();renderAdminPartners();resetPartnerForm();
-  flashSaved('ptSavedNote');
 });
 document.getElementById('ptCancelBtn').addEventListener('click',resetPartnerForm);
 function ptMove(pid,dir){
@@ -1921,7 +2118,13 @@ function ptMove(pid,dir){
     if(list[i].id===pid){
       var j=i+dir;if(j<0||j>=list.length)return;
       var tmp=list[i];list[i]=list[j];list[j]=tmp;
-      savePartners();renderPartners();renderAdminPartners();return;
+      list[i].sortOrder=i;list[j].sortOrder=j;
+      renderPartners();renderAdminPartners();
+      withSaveStatus(Promise.all([
+        DB.updateRow('partners',list[i].id,{sort_order:i}),
+        DB.updateRow('partners',list[j].id,{sort_order:j})
+      ]),'Menyimpan urutan...','Urutan tersimpan.').catch(function(){});
+      return;
     }
   }
 }
@@ -1950,11 +2153,12 @@ function renderAdminPartners(){
   each('.pt-up',function(){ptMove(this.getAttribute('data-pid'),-1);});
   each('.pt-down',function(){ptMove(this.getAttribute('data-pid'),1);});
   each('.pt-toggle',function(){
-    var pid=this.getAttribute('data-pid');
+    var pid=this.getAttribute('data-pid'),newActive=null;
     for(var x=0;x<partnersData.items.length;x++){
-      if(partnersData.items[x].id===pid){partnersData.items[x].active=(partnersData.items[x].active===false);break;}
+      if(partnersData.items[x].id===pid){partnersData.items[x].active=(partnersData.items[x].active===false);newActive=partnersData.items[x].active;break;}
     }
-    savePartners();renderPartners();renderAdminPartners();
+    renderPartners();renderAdminPartners();
+    withSaveStatus(DB.updateRow('partners',pid,{active:newActive}),'Menyimpan...','Status partner diperbarui.').catch(function(){});
   });
   each('.pt-edit',function(){
     var pid=this.getAttribute('data-pid');
@@ -1981,11 +2185,13 @@ function renderAdminPartners(){
     var pid=this.getAttribute('data-pid'),nm='';
     for(var y=0;y<partnersData.items.length;y++){if(partnersData.items[y].id===pid)nm=partnersData.items[y].name;}
     if(!confirm('Hapus "'+nm+'" dari daftar partner?'))return;
-    var next=[];
-    for(var x=0;x<partnersData.items.length;x++){if(partnersData.items[x].id!==pid)next.push(partnersData.items[x]);}
-    partnersData.items=next;
-    if(ptEditId===pid)resetPartnerForm();
-    savePartners();renderPartners();renderAdminPartners();
+    withSaveStatus(DB.removeRow('partners',pid),'Menghapus...','Partner dihapus.').then(function(){
+      var next=[];
+      for(var x=0;x<partnersData.items.length;x++){if(partnersData.items[x].id!==pid)next.push(partnersData.items[x]);}
+      partnersData.items=next;
+      if(ptEditId===pid)resetPartnerForm();
+      renderPartners();renderAdminPartners();
+    }).catch(function(){});
   });
 }
 function loadPartnerSectionForm(){
@@ -1998,15 +2204,20 @@ function loadPartnerSectionForm(){
   document.getElementById('ptGrayscale').checked=partnersData.grayscale!==false;
 }
 document.getElementById('ptSecSaveBtn').addEventListener('click',function(){
-  partnersData.show=document.getElementById('ptShowSection').checked;
-  partnersData.label=document.getElementById('ptSecLabel').value.trim();
-  partnersData.title=document.getElementById('ptSecTitle').value.trim()||'Kolaborasi & Sponsor';
-  partnersData.sub=document.getElementById('ptSecSub').value.trim();
-  partnersData.size=document.getElementById('ptSize').value;
-  partnersData.group=document.getElementById('ptGroup').value;
-  partnersData.grayscale=document.getElementById('ptGrayscale').checked;
-  savePartners();renderPartners();
-  flashSaved('ptSecSavedNote');
+  var show=document.getElementById('ptShowSection').checked;
+  var label=document.getElementById('ptSecLabel').value.trim();
+  var title=document.getElementById('ptSecTitle').value.trim()||'Kolaborasi & Sponsor';
+  var sub=document.getElementById('ptSecSub').value.trim();
+  var size=document.getElementById('ptSize').value;
+  var group=document.getElementById('ptGroup').value;
+  var grayscale=document.getElementById('ptGrayscale').checked;
+  var partnersSection={show:show,label:label,title:title,sub:sub,size:size,group:group,grayscale:grayscale};
+  withSaveStatus(DB.updateSettings({partners_section:partnersSection}),'Menyimpan...','Tampilan partner tersimpan!').then(function(){
+    partnersData.show=show;partnersData.label=label;partnersData.title=title;partnersData.sub=sub;
+    partnersData.size=size;partnersData.group=group;partnersData.grayscale=grayscale;
+    renderPartners();
+    flashSaved('ptSecSavedNote');
+  }).catch(function(){});
 });
 
 /* ═══════ ABOUT & SOCIAL & WA NUMBER ═══════ */
@@ -2016,7 +2227,6 @@ function applyAbout(){
   if(aboutParas[0]&&aboutData[0]!=null)aboutParas[0].innerHTML=aboutData[0];
   if(aboutParas[1]&&aboutData[1]!=null)aboutParas[1].innerHTML=aboutData[1];
 }
-applyAbout();
 var SOCIAL_SVGS={
   instagram:'<svg viewBox="0 0 24 24"><path d="M12 2.2c3.2 0 3.6 0 4.9.1 3.3.1 4.8 1.7 4.9 4.9.1 1.3.1 1.6.1 4.8 0 3.2 0 3.6-.1 4.8-.1 3.2-1.7 4.8-4.9 4.9-1.3.1-1.6.1-4.9.1-3.2 0-3.6 0-4.8-.1-3.3-.1-4.8-1.7-4.9-4.9-.1-1.3-.1-1.6-.1-4.8 0-3.2 0-3.6.1-4.8.1-3.2 1.7-4.8 4.9-4.9 1.2-.1 1.6-.1 4.8-.1zM12 0C8.7 0 8.3 0 7.1.1 2.7.3.3 2.7.1 7.1 0 8.3 0 8.7 0 12s0 3.7.1 4.9c.2 4.4 2.6 6.8 7 7 1.2.1 1.6.1 4.9.1s3.7 0 4.9-.1c4.4-.2 6.8-2.6 7-7 .1-1.2.1-1.6.1-4.9s0-3.7-.1-4.9c-.2-4.4-2.6-6.8-7-7C15.7 0 15.3 0 12 0zm0 5.8a6.2 6.2 0 1 0 0 12.4 6.2 6.2 0 0 0 0-12.4zM12 16a4 4 0 1 1 0-8 4 4 0 0 1 0 8zm6.4-11.8a1.4 1.4 0 1 0 0 2.9 1.4 1.4 0 0 0 0-2.9z"/></svg>',
   whatsapp:'<svg viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413Z"/></svg>',
@@ -2032,26 +2242,31 @@ function applySocial(){
   }
   wrap.innerHTML=h;
 }
-applySocial();
 function applyWaNumber(){
   var pretty=waNumber.replace(/(\d{2})(\d{3})(\d{4})(\d+)/,'+$1 $2-$3-$4');
   document.getElementById('footerWaText').textContent=pretty;
 }
-applyWaNumber();
-var contactData=LS.get('hagia_contact',{address:'Jl. Manis No. 123, Indonesia',hours:'Buka setiap hari, 08.00–20.00 WIB'});
+var contactData={address:'Jl. Manis No. 123, Indonesia',hours:'Buka setiap hari, 08.00–20.00 WIB'};
 function applyContact(){
   document.getElementById('footerAddress').textContent=contactData.address||'';
   document.getElementById('footerHours').textContent=contactData.hours||'';
 }
-applyContact();
 
-/* ═══════ ADMIN: AUTH + PANEL ═══════ */
-var ADMIN_PASSWORD='hagia2026';
+/* ═══════ ADMIN: AUTH (Supabase Authentication) + PANEL ═══════ */
 var adminAccessBtn=document.getElementById('adminAccessBtn'),adminLoginModal=document.getElementById('adminLoginModal'),
     adminPassInput=document.getElementById('adminPassInput'),adminLoginError=document.getElementById('adminLoginError'),
     adminPanelOverlay=document.getElementById('adminPanelOverlay'),adminModeBadge=document.getElementById('adminModeBadge'),
     adminSaveBtn=document.getElementById('adminSaveBtn'),adminProductList=document.getElementById('adminProductList');
-function isAdmin(){return sessionStorage.getItem('hagia_admin')==='1';}
+var _adminLoggedIn=false;
+function isAdmin(){return _adminLoggedIn;}
+/* dipanggil dari bootstrapApp() dengan session hasil DB.getSession(),
+   dan lagi setelah login/logout berhasil — jadi status admin SELALU
+   mencerminkan sesi Supabase Auth yang sesungguhnya, bukan flag lokal. */
+function setAdminSession(session){
+  _adminLoggedIn=!!session;
+  if(_adminLoggedIn)adminModeBadge.classList.add('active');
+  else adminModeBadge.classList.remove('active');
+}
 function openAdminPanel(){
   adminPanelOverlay.classList.add('active');
   adminModeBadge.classList.add('active');
@@ -2067,25 +2282,34 @@ adminAccessBtn.addEventListener('click',function(){
 });
 document.getElementById('adminLoginCancel').addEventListener('click',function(){adminLoginModal.classList.remove('active');adminPassInput.value='';adminLoginError.classList.remove('show');});
 function tryLogin(){
-  if(adminPassInput.value===ADMIN_PASSWORD){
-    sessionStorage.setItem('hagia_admin','1');
+  var pass=adminPassInput.value;
+  if(!pass)return;
+  var submitBtn=document.getElementById('adminLoginSubmit'),origText=submitBtn.textContent;
+  submitBtn.textContent='Memeriksa...';submitBtn.disabled=true;
+  DB.signIn(pass).then(function(session){
+    setAdminSession(session);
     adminLoginModal.classList.remove('active');
     adminPassInput.value='';adminLoginError.classList.remove('show');
     openAdminPanel();
-  }else{
+  }).catch(function(err){
+    console.error(err);
+    adminLoginError.textContent='Password salah atau akun admin belum dibuat di Supabase — coba lagi!';
     adminLoginError.classList.add('show');
     adminPassInput.classList.add('error');
     setTimeout(function(){adminPassInput.classList.remove('error');},600);
-  }
+  }).finally(function(){
+    submitBtn.textContent=origText;submitBtn.disabled=false;
+  });
 }
 document.getElementById('adminLoginSubmit').addEventListener('click',tryLogin);
 adminPassInput.addEventListener('keydown',function(e){if(e.key==='Enter')tryLogin();});
 document.getElementById('adminPanelClose').addEventListener('click',closeAdminPanel);
 adminPanelOverlay.addEventListener('click',function(e){if(e.target===adminPanelOverlay)closeAdminPanel();});
 document.getElementById('adminLogoutBtn').addEventListener('click',function(){
-  sessionStorage.removeItem('hagia_admin');
-  adminModeBadge.classList.remove('active');
-  closeAdminPanel();
+  DB.signOut().then(function(){
+    setAdminSession(null);
+    closeAdminPanel();
+  });
 });
 /* tabs */
 var adminTabs=document.querySelectorAll('.admin-tab');
@@ -2239,10 +2463,15 @@ function attachAdminListeners(){
   for(var f=0;f<fileInputs.length;f++){
     fileInputs[f].addEventListener('change',function(){
       var pid=this.getAttribute('data-pid'),file=this.files[0];if(!file)return;
-      processImageFile(file,function(dataUrl){
+      showSaveStatus('busy','Mengupload gambar...');
+      DB.uploadImage(file,'products').then(function(url){
         syncAdminFormToState();
-        var p=getProductById(pid);if(p)p.image=dataUrl;
+        var p=getProductById(pid);if(p)p.image=url;
         renderAdminProducts();
+        showSaveStatus('ok','Gambar terupload — klik Simpan Perubahan untuk menyimpan.');
+      }).catch(function(err){
+        console.error(err);
+        showSaveStatus('err','Upload gambar gagal: '+(err&&err.message?err.message:'periksa koneksi'));
       });
     });
   }
@@ -2263,23 +2492,31 @@ function attachAdminListeners(){
 function closeDeleteModal(){deleteConfirmModal.classList.remove('active');deleteTargetId=null;}
 document.getElementById('confirmDeleteBtn').addEventListener('click',function(){
   if(deleteTargetId){
-    var next=[];
-    for(var i=0;i<products.length;i++){if(products[i].id!==deleteTargetId)next.push(products[i]);}
-    products=next;renderAdminProducts();closeDeleteModal();
+    var pid=deleteTargetId;
+    withSaveStatus(DB.removeRow('products',pid),'Menghapus...','Produk dihapus.').then(function(){
+      var next=[];
+      for(var i=0;i<products.length;i++){if(products[i].id!==pid)next.push(products[i]);}
+      products=next;
+      renderAdminProducts();renderMenu();
+      closeDeleteModal();
+    }).catch(function(){closeDeleteModal();});
   }
 });
 document.getElementById('cancelDeleteBtn').addEventListener('click',closeDeleteModal);
 
 /* Add product */
 document.getElementById('adminAddProduct').addEventListener('click',function(){
-  products.push({id:'p'+Date.now(),name:'Produk Baru',category:'cake',price:'Rp 0',rawPrice:'0',
+  var newProduct={id:'p'+Date.now(),name:'Produk Baru',category:'cake',price:'Rp 0',rawPrice:'0',
     desc:'Deskripsi produk baru...',longDesc:'',sizeInfo:'',variants:[],
-    tag:'New!',tagColor:'#C89F7C',image:null,emoji:'🧁'});
-  renderAdminProducts();
-  setTimeout(function(){adminProductList.scrollTop=adminProductList.scrollHeight;},100);
+    tag:'New!',tagColor:'#C89F7C',image:null,emoji:'🧁',sortOrder:products.length};
+  withSaveStatus(DB.insertRow('products',Object.assign({id:newProduct.id},productToRow(newProduct))),'Menyimpan...','Produk baru tersimpan!').then(function(){
+    products.push(newProduct);
+    renderAdminProducts();
+    setTimeout(function(){adminProductList.scrollTop=adminProductList.scrollHeight;},100);
+  }).catch(function(){});
 });
 
-/* SAVE — dua tahap: validasi dulu, baru terapkan + persist + re-render semua tampilan */
+/* SAVE — dua tahap: validasi dulu, baru terapkan + persist ke Supabase + re-render semua tampilan */
 adminSaveBtn.addEventListener('click',function(){
   var cards=document.querySelectorAll('.admin-product-card');
   var hasError=false,parsed=[];
@@ -2312,25 +2549,29 @@ adminSaveBtn.addEventListener('click',function(){
     setTimeout(function(){adminSaveBtn.style.animation='';},400);
     return;
   }
+  var touched=[];
   for(var k=0;k<parsed.length;k++){
     var data=parsed[k],p=getProductById(data.pid);if(!p)continue;
     p.name=data.name;p.desc=data.desc;p.longDesc=data.longDesc;p.sizeInfo=data.sizeInfo;
     p.category=data.category;p.tag=data.tag;p.variants=data.variants;
     if(data.variants.length){p.rawPrice=data.variants[0].price;p.price=formatRupiah(data.variants[0].price);}
     else{p.rawPrice=data.rawPrice;p.price=formatRupiah(data.rawPrice);}
+    touched.push(p);
   }
-  var saved=LS.set('hagia_products',products);
-  renderMenu(); /* re-render card landing page (gambar baru langsung tampil) */
-  if(currentModalPid&&pmOverlay&&pmOverlay.classList.contains('active'))populateProductModal(currentModalPid);
   var orig=adminSaveBtn.innerHTML;
-  if(saved){
+  adminSaveBtn.innerHTML='Menyimpan...';
+  var updates=touched.map(function(p){return DB.updateRow('products',p.id,productToRow(p));});
+  withSaveStatus(Promise.all(updates),'Menyimpan semua produk...','Semua produk tersimpan!').then(function(){
+    renderMenu(); /* re-render card landing page (gambar baru langsung tampil) */
+    if(currentModalPid&&pmOverlay&&pmOverlay.classList.contains('active'))populateProductModal(currentModalPid);
     adminSaveBtn.innerHTML='✓ Tersimpan!';
     adminSaveBtn.style.background='#2E7D32';
-  }else{
-    adminSaveBtn.innerHTML='⚠ Storage penuh — coba gambar lebih kecil!';
+    setTimeout(function(){adminSaveBtn.innerHTML=orig;adminSaveBtn.style.background='';},1500);
+  }).catch(function(){
+    adminSaveBtn.innerHTML='⚠ Gagal menyimpan — periksa koneksi';
     adminSaveBtn.style.background='#C62828';
-  }
-  setTimeout(function(){adminSaveBtn.innerHTML=orig;adminSaveBtn.style.background='';},saved?1500:3200);
+    setTimeout(function(){adminSaveBtn.innerHTML=orig;adminSaveBtn.style.background='';},3200);
+  });
 });
 
 /* ═══════ ADMIN: TESTIMONIAL MODERATION ═══════ */
@@ -2350,10 +2591,13 @@ function renderAdminTestimonials(){
   var dels=wrap.querySelectorAll('.admin-tdel');
   for(var d=0;d<dels.length;d++){
     dels[d].addEventListener('click',function(){
-      var tid=this.getAttribute('data-tid'),next=[];
-      for(var x=0;x<testimonials.length;x++){if(testimonials[x].id!==tid)next.push(testimonials[x]);}
-      testimonials=next;LS.set('hagia_testimonials',testimonials);
-      renderAdminTestimonials();renderTestimonials();
+      var tid=this.getAttribute('data-tid');
+      if(!confirm('Hapus testimoni ini?'))return;
+      withSaveStatus(DB.removeRow('testimonials',tid),'Menghapus...','Testimoni dihapus.').then(function(){
+        var next=[];for(var x=0;x<testimonials.length;x++){if(testimonials[x].id!==tid)next.push(testimonials[x]);}
+        testimonials=next;
+        renderAdminTestimonials();renderTestimonials();
+      }).catch(function(){});
     });
   }
 }
@@ -2398,7 +2642,6 @@ for(var ati=0;ati<analyticsTabs.length;ati++){
 }
 
 /* ═══════ ADMIN: RESET RATING ═══════ */
-function saveRatings(){LS.set('hagia_ratings',menuRatings);}
 function refreshAllRatings(){
   for(var i=0;i<products.length;i++)refreshRating(products[i].id);
   renderRatingReset();renderAnalytics();
@@ -2421,11 +2664,12 @@ function renderRatingReset(){
       var pid=this.getAttribute('data-reset-pid'),prod=null;
       for(var k=0;k<products.length;k++){if(products[k].id===pid)prod=products[k];}
       if(!confirm('Reset semua rating untuk "'+(prod?prod.name:pid)+'"? Tindakan ini tidak bisa dibatalkan.'))return;
-      delete menuRatings[pid];
-      saveRatings();
-      refreshRating(pid);
-      renderRatingReset();renderAnalytics();
-      flashSaved('ratingResetNote');
+      withSaveStatus(DB.removeWhere('ratings','product_id',pid),'Menghapus...','Rating direset.').then(function(){
+        delete menuRatings[pid];
+        refreshRating(pid);
+        renderRatingReset();renderAnalytics();
+        flashSaved('ratingResetNote');
+      }).catch(function(){});
     };
   }
   var allBtn=document.getElementById('ratingResetAllBtn');
@@ -2433,14 +2677,15 @@ function renderRatingReset(){
 }
 document.getElementById('ratingResetAllBtn').addEventListener('click',function(){
   if(!confirm('Reset SEMUA rating dari semua menu? Tindakan ini tidak bisa dibatalkan.'))return;
-  menuRatings={};
-  saveRatings();
-  refreshAllRatings();
-  flashSaved('ratingResetNote');
+  var pids=products.map(function(p){return p.id;});
+  withSaveStatus(Promise.all(pids.map(function(pid){return DB.removeWhere('ratings','product_id',pid);})),'Menghapus...','Semua rating direset.').then(function(){
+    menuRatings={};
+    refreshAllRatings();
+    flashSaved('ratingResetNote');
+  }).catch(function(){});
 });
 
 /* ═══════ FINANCE ═══════ */
-function saveFinance(){LS.set('hagia_finance',finance);}
 var finEditId=null;
 function renderFinance(){
   var bodyEl=document.getElementById('financeTableBody'),emptyEl=document.getElementById('financeEmpty');if(!bodyEl)return;
@@ -2483,9 +2728,12 @@ function renderFinance(){
   var delBtns=bodyEl.querySelectorAll('.fin-del');
   for(var dl=0;dl<delBtns.length;dl++){
     delBtns[dl].addEventListener('click',function(){
-      var fid=this.getAttribute('data-fid'),next=[];
-      for(var x=0;x<finance.length;x++){if(finance[x].id!==fid)next.push(finance[x]);}
-      finance=next;saveFinance();renderFinance();
+      var fid=this.getAttribute('data-fid');
+      if(!confirm('Hapus transaksi ini?'))return;
+      withSaveStatus(DB.removeRow('transactions',fid),'Menghapus...','Transaksi dihapus.').then(function(){
+        var next=[];for(var x=0;x<finance.length;x++){if(finance[x].id!==fid)next.push(finance[x]);}
+        finance=next;renderFinance();
+      }).catch(function(){});
     });
   }
 }
@@ -2493,17 +2741,23 @@ document.getElementById('finSubmitBtn').addEventListener('click',function(){
   var date=document.getElementById('finDate').value,desc=document.getElementById('finDesc').value.trim();
   var type=document.getElementById('finType').value,amount=parseFloat(document.getElementById('finAmount').value)||0;
   if(!date||!desc||amount<=0){this.style.animation='shake 0.4s ease';var self=this;setTimeout(function(){self.style.animation='';},400);return;}
+  var self2=this;
   if(finEditId){
-    for(var i=0;i<finance.length;i++){
-      if(finance[i].id===finEditId){finance[i].date=date;finance[i].desc=desc;finance[i].type=type;finance[i].amount=amount;break;}
-    }
-    finEditId=null;this.textContent='Tambah Transaksi';
+    var fid=finEditId,patch={txn_date:date,description:desc,type:type,amount:amount};
+    withSaveStatus(DB.updateRow('transactions',fid,patch),'Menyimpan...','Transaksi diperbarui.').then(function(){
+      for(var i=0;i<finance.length;i++){if(finance[i].id===fid){finance[i].date=date;finance[i].desc=desc;finance[i].type=type;finance[i].amount=amount;break;}}
+      finEditId=null;self2.textContent='Tambah Transaksi';
+      document.getElementById('finDate').value='';document.getElementById('finDesc').value='';document.getElementById('finAmount').value='';
+      renderFinance();
+    }).catch(function(){});
   }else{
-    finance.push({id:'f'+Date.now(),date:date,desc:desc,type:type,amount:amount});
+    var id='f'+Date.now();
+    withSaveStatus(DB.insertRow('transactions',{id:id,txn_date:date,description:desc,type:type,amount:amount}),'Menyimpan...','Transaksi tersimpan.').then(function(){
+      finance.push({id:id,date:date,desc:desc,type:type,amount:amount});
+      document.getElementById('finDate').value='';document.getElementById('finDesc').value='';document.getElementById('finAmount').value='';
+      renderFinance();
+    }).catch(function(){});
   }
-  saveFinance();
-  document.getElementById('finDate').value='';document.getElementById('finDesc').value='';document.getElementById('finAmount').value='';
-  renderFinance();
 });
 
 /* ═══════ SETTINGS ═══════ */
@@ -2518,34 +2772,106 @@ function loadSettingsForms(){
 }
 function flashSaved(id){var n=document.getElementById(id);if(!n)return;n.classList.add('show');setTimeout(function(){n.classList.remove('show');},1800);}
 document.getElementById('aboutSaveBtn').addEventListener('click',function(){
-  aboutData=[document.getElementById('aboutText1').value,document.getElementById('aboutText2').value];
-  LS.set('hagia_about',aboutData);applyAbout();flashSaved('aboutSavedNote');
+  var t1=document.getElementById('aboutText1').value,t2=document.getElementById('aboutText2').value;
+  withSaveStatus(DB.updateSettings({about_text1:t1,about_text2:t2}),'Menyimpan...','About tersimpan!').then(function(){
+    aboutData=[t1,t2];applyAbout();flashSaved('aboutSavedNote');
+  }).catch(function(){});
 });
 document.getElementById('socialSaveBtn').addEventListener('click',function(){
-  var inputs=document.querySelectorAll('.social-input');socialData={};
-  for(var i=0;i<inputs.length;i++){socialData[inputs[i].getAttribute('data-key')]=inputs[i].value.trim();}
-  LS.set('hagia_social',socialData);applySocial();flashSaved('socialSavedNote');
+  var inputs=document.querySelectorAll('.social-input'),newSocial={};
+  for(var i=0;i<inputs.length;i++){newSocial[inputs[i].getAttribute('data-key')]=inputs[i].value.trim();}
+  withSaveStatus(DB.updateSettings({social:newSocial}),'Menyimpan...','Social links tersimpan!').then(function(){
+    socialData=newSocial;applySocial();flashSaved('socialSavedNote');
+  }).catch(function(){});
 });
 document.getElementById('waSaveBtn').addEventListener('click',function(){
   var input=document.getElementById('waNumberInput'),num=input.value.replace(/[^0-9]/g,'');
   if(!num){input.style.borderColor='#C62828';setTimeout(function(){input.style.borderColor='';},1600);return;}
-  waNumber=num;LS.set('hagia_wa_number',waNumber);
-  applyWaNumber();
-  renderMenu(); /* refresh semua link Order via WhatsApp */
-  flashSaved('waSavedNote');
+  withSaveStatus(DB.updateSettings({wa_number:num}),'Menyimpan...','Nomor WhatsApp tersimpan!').then(function(){
+    waNumber=num;applyWaNumber();renderMenu();flashSaved('waSavedNote');
+  }).catch(function(){});
 });
 document.getElementById('contactSaveBtn').addEventListener('click',function(){
-  contactData={address:document.getElementById('contactAddressInput').value.trim(),hours:document.getElementById('contactHoursInput').value.trim()};
-  LS.set('hagia_contact',contactData);applyContact();flashSaved('contactSavedNote');
+  var address=document.getElementById('contactAddressInput').value.trim(),hours=document.getElementById('contactHoursInput').value.trim();
+  withSaveStatus(DB.updateSettings({address:address,hours:hours}),'Menyimpan...','Info kontak tersimpan!').then(function(){
+    contactData={address:address,hours:hours};applyContact();flashSaved('contactSavedNote');
+  }).catch(function(){});
 });
 
-/* ═══════ INIT ═══════ */
+/* ═══════ INIT / BOOTSTRAP FROM SUPABASE ═══════
+   Ini satu-satunya tempat data awal diambil. Setelah ini, setiap
+   perubahan lewat Admin Panel langsung ditulis ke Supabase (lihat
+   fungsi masing-masing CRUD di atas), sehingga semua device yang
+   membuka website akan selalu mendapat data terbaru dari sini. */
 var today=new Date();
 document.getElementById('finDate').value=today.getFullYear()+'-'+String(today.getMonth()+1).padStart(2,'0')+'-'+String(today.getDate()).padStart(2,'0');
-renderMenu();
-renderTestimonials();
-observeReveals();
-if(isAdmin())adminModeBadge.classList.add('active');
+
+function groupRatings(rows){
+  var out={};
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i];
+    if(!out[r.product_id])out[r.product_id]=[];
+    out[r.product_id].push({stars:r.stars,ts:new Date(r.created_at).getTime()});
+  }
+  return out;
+}
+
+async function bootstrapApp(){
+  document.getElementById('cloudLoadingText').textContent='Memuat data terbaru dari server...';
+  document.getElementById('cloudLoadingOverlay').classList.remove('hidden');
+  if(!DB.init()){
+    showCloudError('Konfigurasi Supabase belum diisi. Buka file HTML, isi SUPABASE_URL dan SUPABASE_ANON_KEY sesuai supabase_setup/02_SETUP_GUIDE.md.',bootstrapApp);
+    return;
+  }
+  try{
+    var results=await Promise.all([
+      DB.fetchAll('products','sort_order'),
+      DB.fetchAll('events','sort_order'),
+      DB.fetchAll('testimonials','created_at'),
+      DB.fetchAll('partners','sort_order'),
+      DB.fetchAll('ratings'),
+      DB.fetchAll('transactions','txn_date'),
+      DB.getSettings(),
+      DB.getSession()
+    ]);
+    var productRows=results[0],eventRows=results[1],testiRows=results[2],partnerRows=results[3],ratingRows=results[4],txnRows=results[5],settings=results[6],session=results[7];
+
+    products=productRows.map(rowToProduct);
+    events=eventRows.map(rowToEvent);
+    testimonials=testiRows.map(rowToTestimonial);
+    menuRatings=groupRatings(ratingRows);
+    partnersData.items=partnerRows.map(rowToPartner);
+    finance=txnRows.map(rowToTransaction);
+
+    if(settings){
+      waNumber=settings.wa_number||waNumber;
+      contactData={address:settings.address||contactData.address,hours:settings.hours||contactData.hours};
+      aboutData=[settings.about_text1||'',settings.about_text2||''];
+      socialData=settings.social||socialData;
+      if(settings.partners_section){
+        var ps=settings.partners_section;
+        partnersData.show=ps.show!==false;partnersData.label=ps.label||partnersData.label;
+        partnersData.title=ps.title||partnersData.title;partnersData.sub=ps.sub||'';
+        partnersData.size=ps.size||'md';partnersData.group=ps.group||'type';
+        partnersData.grayscale=ps.grayscale!==false;
+      }
+    }
+
+    setAdminSession(session);
+
+    renderMenu();
+    renderEvents();
+    renderPartners();
+    renderTestimonials();
+    applyAbout();applySocial();applyWaNumber();applyContact();
+    observeReveals();
+    hideCloudLoading();
+  }catch(err){
+    console.error(err);
+    showCloudError('Tidak bisa memuat data terbaru. Periksa koneksi internet Anda lalu coba lagi. ('+(err&&err.message?err.message:'unknown error')+')',bootstrapApp);
+  }
+}
+bootstrapApp();
 })();
 </script>
 </body>
