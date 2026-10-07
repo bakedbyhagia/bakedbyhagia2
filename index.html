@@ -1156,14 +1156,27 @@ function isNetworkError(e){
   var m=String(e.message||'');
   return e.name==='AuthRetryableFetchError'||e.status===0||/failed to fetch|networkerror|network request failed|load failed/i.test(m);
 }
+function isMissingColumnError(e){
+  if(!e)return false;
+  var m=String(e.message||'');
+  return e.code==='42703'||e.code==='PGRST204'||e.code==='22P02'||/column .* does not exist|could not find .* column|invalid input syntax/i.test(m);
+}
+function classifyDbError(e){
+  if(isNetworkError(e))return 'NETWORK';
+  var m=String((e&&e.message)||'');
+  if((e&&e.code==='42501')||(e&&(e.status===401||e.status===403))||/row-level security|permission denied|rls/i.test(m))return 'RLS';
+  return 'DB_ERROR';
+}
 function adminErrMsg(err){
   var c=err&&err.adminCode;
   if(c==='BAD_CREDENTIALS')return 'Email atau password salah.';
-  if(c==='NOT_IN_ADMIN_USERS')return 'User Supabase ditemukan tetapi belum terdaftar pada admin_users.';
-  if(c==='NO_ADMIN_ROLE')return 'Akun berhasil login, tetapi akun ini belum memiliki akses Admin Panel.';
-  if(c==='RLS')return 'Gagal memverifikasi hak akses admin. Periksa policy/RLS Supabase.';
-  if(c==='NO_SESSION')return 'Sesi login tidak ditemukan. Silakan login ulang.';
+  if(c==='NOT_IN_ADMIN_USERS')return 'Login berhasil, tetapi akun ini belum terdaftar sebagai admin di Supabase.';
+  if(c==='NO_ADMIN_ROLE')return 'Login berhasil, tetapi akun ini belum memiliki role admin pada tabel admin_users.';
+  if(c==='RLS')return 'Login berhasil, tetapi data hak akses admin tidak dapat dibaca. Periksa RLS/policy tabel admin_users di Supabase.';
+  if(c==='DB_ERROR')return 'Login berhasil, tetapi terjadi kesalahan database saat memeriksa hak admin'+(err.orig&&err.orig.message?' ('+err.orig.message+')':'')+'.';
+  if(c==='NO_SESSION')return 'Sesi login tidak ditemukan atau sudah berakhir. Silakan login ulang.';
   if(c==='NETWORK'||isNetworkError(err))return 'Tidak dapat terhubung ke Supabase. Periksa koneksi internet.';
+  if(c==='AUTH')return 'Login gagal: '+(err.orig&&err.orig.message?err.orig.message:'autentikasi ditolak')+'.';
   return 'Login gagal: '+(err&&err.message?err.message:'kesalahan tidak diketahui');
 }
 
@@ -1231,35 +1244,66 @@ var DB={
     });
   },
   /* TAHAP 1 — AUTHENTICATION (Supabase Auth: email + password)
-     TAHAP 2 — AUTHORIZATION (auth.users.id harus ada di public.admin_users dgn role admin/owner) */
+     TAHAP 2 — AUTHORIZATION (auth.users.id harus ada di public.admin_users; jika ada kolom role, harus admin/owner) */
   signIn:function(email,password){
     return supabaseClient.auth.signInWithPassword({email:email,password:password}).then(function(res){
       if(res.error){
         var code=(isNetworkError(res.error))?'NETWORK':
-                 (res.error.code==='invalid_credentials'||res.error.status===400)?'BAD_CREDENTIALS':'AUTH';
+                 (res.error.code==='invalid_credentials'||/invalid login credentials/i.test(res.error.message||''))?'BAD_CREDENTIALS':'AUTH';
         throw adminAuthError(code,res.error);
       }
       return DB.verifyAdmin();
     });
   },
-  /* Cek hak admin untuk user yang SEDANG login, berdasarkan auth.users.id (bukan email).
-     Jika bukan admin → otomatis signOut lalu lempar error. */
+  /* Cari baris admin untuk user Auth yang sedang login.
+     Prioritas: admin_users.id = auth.users.id. Fallback (hanya bila baris belum ketemu):
+     kolom user_id, lalu email yang sudah terkonfirmasi. Kolom yang tidak ada dilewati.
+     Mengembalikan {row, error}. Tidak pernah melempar. */
+  findAdminRow:function(user){
+    var attempts=[['id',user.id],['user_id',user.id]];
+    if(user.email&&(user.email_confirmed_at||user.confirmed_at))attempts.push(['email',user.email]);
+    var i=0;
+    function next(){
+      if(i>=attempts.length)return Promise.resolve({row:null,error:null});
+      var col=attempts[i][0],val=attempts[i][1];i++;
+      var q=supabaseClient.from('admin_users').select('*');
+      q=(col==='email')?q.ilike('email',String(val).replace(/[\\%_]/g,'\\$&')):q.eq(col,val);
+      return q.maybeSingle().then(function(r){
+        if(r.error){
+          if(col!=='id'&&isMissingColumnError(r.error))return next();
+          return {row:null,error:r.error};
+        }
+        if(r.data){r.data.__matchedBy=col;return {row:r.data,error:null};}
+        return next();
+      },function(ex){return {row:null,error:ex};});
+    }
+    return next();
+  },
+  /* Cek hak admin untuk user yang SEDANG login (getUser → admin_users).
+     TIDAK memanggil signOut otomatis: penyebab kegagalan dilempar apa adanya agar mudah di-debug. */
   verifyAdmin:function(){
     return supabaseClient.auth.getUser().then(function(ur){
       if(ur.error||!ur.data||!ur.data.user){
         throw adminAuthError(isNetworkError(ur.error)?'NETWORK':'NO_SESSION',ur.error);
       }
       var user=ur.data.user;
-      return supabaseClient.from('admin_users').select('id, email, role').eq('id',user.id).maybeSingle().then(function(r){
-        if(r.error)throw adminAuthError(isNetworkError(r.error)?'NETWORK':'RLS',r.error);
-        var deny=null;
-        if(!r.data)deny='NOT_IN_ADMIN_USERS';
-        else if(ADMIN_ROLES.indexOf(r.data.role)===-1)deny='NO_ADMIN_ROLE';
-        if(deny){
-          return supabaseClient.auth.signOut().then(function(){throw adminAuthError(deny,null);},
-                                                    function(){throw adminAuthError(deny,null);});
+      console.log('[ADMIN AUTH] Auth user:',{id:user.id,email:user.email});
+      return DB.findAdminRow(user).then(function(f){
+        var matchedBy=f.row?f.row.__matchedBy:null;
+        if(f.row)delete f.row.__matchedBy;
+        console.log('[ADMIN AUTH] Admin row:',f.row);
+        console.log('[ADMIN AUTH] Admin query error:',f.error);
+        if(f.error)throw adminAuthError(classifyDbError(f.error),f.error);
+        if(!f.row){
+          console.warn('[ADMIN AUTH] Tidak ada baris admin_users untuk user ini. Jika baris SUDAH ada di tabel, kemungkinan policy RLS menyembunyikannya (SELECT harus mengizinkan id = auth.uid()).');
+          throw adminAuthError('NOT_IN_ADMIN_USERS',null);
         }
-        return r.data;
+        if(matchedBy&&matchedBy!=='id')console.warn('[ADMIN AUTH] Baris admin cocok lewat kolom "'+matchedBy+'", bukan id.');
+        if(Object.prototype.hasOwnProperty.call(f.row,'role')&&
+           ADMIN_ROLES.indexOf(String(f.row.role==null?'':f.row.role).toLowerCase())===-1){
+          throw adminAuthError('NO_ADMIN_ROLE',null);
+        }
+        return f.row;
       });
     });
   },
