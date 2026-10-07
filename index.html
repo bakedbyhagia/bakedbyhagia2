@@ -788,9 +788,10 @@ section{padding:60px 20px}
         <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
       </div>
       <h3>Admin Login</h3>
-      <p>Masukkan password untuk mengelola toko.</p>
+      <p>Masuk dengan akun admin untuk mengelola toko.</p>
     </div>
     <div class="admin-modal-body">
+      <input type="email" class="admin-input" id="adminEmailInput" placeholder="Email admin" autocomplete="username" inputmode="email">
       <input type="password" class="admin-input" id="adminPassInput" placeholder="Password" autocomplete="current-password">
       <div class="admin-error" id="adminLoginError">Password salah, coba lagi!</div>
       <div class="admin-modal-body admin-modal-actions">
@@ -1130,7 +1131,10 @@ section{padding:60px 20px}
    dibatasi oleh Row Level Security di database, bukan oleh key ini. */
 var SUPABASE_URL = 'https://euwrxncmytpyaxnzwwuq.supabase.co';
 var SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV1d3J4bmNteXRweWF4bnp3d3VxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk0NTczOTMsImV4cCI6MjEwNTAzMzM5M30.sh9Qk8ybjEdj1R9DH01OOqLpXmjXtdsHJr_smpYWAR8';
-var ADMIN_EMAIL = 'admin@bakedbyhagia.com';
+/* Daftar admin TIDAK di-hardcode di sini. Admin dikelola dari Supabase:
+   tabel public.admin_users (id = auth.users.id, role = 'admin' | 'owner').
+   Cara tambah/hapus/ubah role admin: lihat README.md & supabase_admin_auth.sql */
+var ADMIN_ROLES = ['admin','owner'];
 var STORAGE_BUCKET = 'site-images';
 
 /* ═══════ STORAGE HELPERS (khusus preferensi UI, BUKAN data konten) ═══════ */
@@ -1142,6 +1146,27 @@ var LS={
 /* ═══════ DB — Supabase data-access layer ═══════
    Semua data utama website (produk, event, testimoni, partner, rating,
    settings, transaksi) dibaca/ditulis lewat sini ke database online. */
+/* ═══════ ADMIN AUTH HELPERS ═══════ */
+function adminAuthError(code,orig){
+  var e=new Error(code+(orig&&orig.message?': '+orig.message:''));
+  e.adminCode=code;e.orig=orig||null;return e;
+}
+function isNetworkError(e){
+  if(!e)return false;
+  var m=String(e.message||'');
+  return e.name==='AuthRetryableFetchError'||e.status===0||/failed to fetch|networkerror|network request failed|load failed/i.test(m);
+}
+function adminErrMsg(err){
+  var c=err&&err.adminCode;
+  if(c==='BAD_CREDENTIALS')return 'Email atau password salah.';
+  if(c==='NOT_IN_ADMIN_USERS')return 'User Supabase ditemukan tetapi belum terdaftar pada admin_users.';
+  if(c==='NO_ADMIN_ROLE')return 'Akun berhasil login, tetapi akun ini belum memiliki akses Admin Panel.';
+  if(c==='RLS')return 'Gagal memverifikasi hak akses admin. Periksa policy/RLS Supabase.';
+  if(c==='NO_SESSION')return 'Sesi login tidak ditemukan. Silakan login ulang.';
+  if(c==='NETWORK'||isNetworkError(err))return 'Tidak dapat terhubung ke Supabase. Periksa koneksi internet.';
+  return 'Login gagal: '+(err&&err.message?err.message:'kesalahan tidak diketahui');
+}
+
 var supabaseClient=null;
 var DB={
   ready:false,
@@ -1205,9 +1230,37 @@ var DB={
       return pub.data.publicUrl;
     });
   },
-  signIn:function(password){
-    return supabaseClient.auth.signInWithPassword({email:ADMIN_EMAIL,password:password}).then(function(res){
-      if(res.error)throw res.error;return res.data.session;
+  /* TAHAP 1 — AUTHENTICATION (Supabase Auth: email + password)
+     TAHAP 2 — AUTHORIZATION (auth.users.id harus ada di public.admin_users dgn role admin/owner) */
+  signIn:function(email,password){
+    return supabaseClient.auth.signInWithPassword({email:email,password:password}).then(function(res){
+      if(res.error){
+        var code=(isNetworkError(res.error))?'NETWORK':
+                 (res.error.code==='invalid_credentials'||res.error.status===400)?'BAD_CREDENTIALS':'AUTH';
+        throw adminAuthError(code,res.error);
+      }
+      return DB.verifyAdmin();
+    });
+  },
+  /* Cek hak admin untuk user yang SEDANG login, berdasarkan auth.users.id (bukan email).
+     Jika bukan admin → otomatis signOut lalu lempar error. */
+  verifyAdmin:function(){
+    return supabaseClient.auth.getUser().then(function(ur){
+      if(ur.error||!ur.data||!ur.data.user){
+        throw adminAuthError(isNetworkError(ur.error)?'NETWORK':'NO_SESSION',ur.error);
+      }
+      var user=ur.data.user;
+      return supabaseClient.from('admin_users').select('id, email, role').eq('id',user.id).maybeSingle().then(function(r){
+        if(r.error)throw adminAuthError(isNetworkError(r.error)?'NETWORK':'RLS',r.error);
+        var deny=null;
+        if(!r.data)deny='NOT_IN_ADMIN_USERS';
+        else if(ADMIN_ROLES.indexOf(r.data.role)===-1)deny='NO_ADMIN_ROLE';
+        if(deny){
+          return supabaseClient.auth.signOut().then(function(){throw adminAuthError(deny,null);},
+                                                    function(){throw adminAuthError(deny,null);});
+        }
+        return r.data;
+      });
     });
   },
   signOut:function(){return supabaseClient.auth.signOut();},
@@ -2254,16 +2307,15 @@ function applyContact(){
 
 /* ═══════ ADMIN: AUTH (Supabase Authentication) + PANEL ═══════ */
 var adminAccessBtn=document.getElementById('adminAccessBtn'),adminLoginModal=document.getElementById('adminLoginModal'),
-    adminPassInput=document.getElementById('adminPassInput'),adminLoginError=document.getElementById('adminLoginError'),
+    adminPassInput=document.getElementById('adminPassInput'),adminEmailInput=document.getElementById('adminEmailInput'),adminLoginError=document.getElementById('adminLoginError'),
     adminPanelOverlay=document.getElementById('adminPanelOverlay'),adminModeBadge=document.getElementById('adminModeBadge'),
     adminSaveBtn=document.getElementById('adminSaveBtn'),adminProductList=document.getElementById('adminProductList');
 var _adminLoggedIn=false;
 function isAdmin(){return _adminLoggedIn;}
-/* dipanggil dari bootstrapApp() dengan session hasil DB.getSession(),
-   dan lagi setelah login/logout berhasil — jadi status admin SELALU
-   mencerminkan sesi Supabase Auth yang sesungguhnya, bukan flag lokal. */
-function setAdminSession(session){
-  _adminLoggedIn=!!session;
+/* ok=true HANYA setelah DB.verifyAdmin() sukses (sesi Supabase valid DAN ada di admin_users).
+   Bukan sekadar "ada session" — login berhasil ≠ otomatis admin. */
+function setAdminSession(ok){
+  _adminLoggedIn=!!ok;
   if(_adminLoggedIn)adminModeBadge.classList.add('active');
   else adminModeBadge.classList.remove('active');
 }
@@ -2276,38 +2328,77 @@ function closeAdminPanel(){
   adminPanelOverlay.classList.remove('active');
   if(!isAdmin())adminModeBadge.classList.remove('active');
 }
+function showAdminLogin(msg){
+  adminLoginModal.classList.add('active');
+  if(msg){adminLoginError.textContent=msg;adminLoginError.classList.add('show');}
+  else adminLoginError.classList.remove('show');
+  setTimeout(function(){(adminEmailInput.value?adminPassInput:adminEmailInput).focus();},350);
+}
 adminAccessBtn.addEventListener('click',function(){
-  if(isAdmin()){openAdminPanel();}
-  else{adminLoginModal.classList.add('active');setTimeout(function(){adminPassInput.focus();},350);}
+  if(isAdmin()){
+    /* verifikasi ulang ke Supabase tiap panel dibuka (mis. admin dihapus dari admin_users) */
+    DB.verifyAdmin().then(function(){openAdminPanel();}).catch(function(err){
+      console.error(err);setAdminSession(false);closeAdminPanel();showAdminLogin(adminErrMsg(err));
+    });
+  }else{showAdminLogin();}
 });
 document.getElementById('adminLoginCancel').addEventListener('click',function(){adminLoginModal.classList.remove('active');adminPassInput.value='';adminLoginError.classList.remove('show');});
 function tryLogin(){
-  var pass=adminPassInput.value;
-  if(!pass)return;
+  var email=adminEmailInput.value.trim(),pass=adminPassInput.value;
+  if(!email||!pass){
+    adminLoginError.textContent='Isi email dan password admin.';adminLoginError.classList.add('show');return;
+  }
   var submitBtn=document.getElementById('adminLoginSubmit'),origText=submitBtn.textContent;
   submitBtn.textContent='Memeriksa...';submitBtn.disabled=true;
-  DB.signIn(pass).then(function(session){
-    setAdminSession(session);
+  _loginInFlight=true; /* listener auth tidak ikut memverifikasi selama proses login berjalan */
+  DB.signIn(email,pass).then(function(){
+    setAdminSession(true);
     adminLoginModal.classList.remove('active');
     adminPassInput.value='';adminLoginError.classList.remove('show');
     openAdminPanel();
   }).catch(function(err){
     console.error(err);
-    adminLoginError.textContent='Password salah atau akun admin belum dibuat di Supabase — coba lagi!';
+    setAdminSession(false);
+    adminLoginError.textContent=adminErrMsg(err);
     adminLoginError.classList.add('show');
     adminPassInput.classList.add('error');
     setTimeout(function(){adminPassInput.classList.remove('error');},600);
   }).finally(function(){
+    _loginInFlight=false;
     submitBtn.textContent=origText;submitBtn.disabled=false;
   });
 }
+/* Sinkronkan Admin Panel dengan event Supabase Auth (SIGNED_IN / SIGNED_OUT / TOKEN_REFRESHED).
+   Listener ini HANYA memverifikasi — tidak pernah memanggil signIn → tidak ada loop. */
+var _authListenerBound=false,_loginInFlight=false;
+function bindAuthListener(){
+  if(_authListenerBound||!supabaseClient)return;
+  _authListenerBound=true;
+  supabaseClient.auth.onAuthStateChange(function(event,session){
+    if(_loginInFlight)return;
+    /* jangan panggil API Supabase langsung di dalam callback → tunda dgn setTimeout */
+    setTimeout(function(){
+      if(event==='SIGNED_OUT'||!session){
+        if(isAdmin()){setAdminSession(false);closeAdminPanel();}
+        return;
+      }
+      if(event==='SIGNED_IN'||event==='TOKEN_REFRESHED'){
+        DB.verifyAdmin().then(function(){setAdminSession(true);},function(err){
+          console.warn(err);
+          if(isAdmin()){setAdminSession(false);closeAdminPanel();}
+        });
+      }
+    },0);
+  });
+}
 document.getElementById('adminLoginSubmit').addEventListener('click',tryLogin);
+adminEmailInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();adminPassInput.focus();}});
 adminPassInput.addEventListener('keydown',function(e){if(e.key==='Enter')tryLogin();});
 document.getElementById('adminPanelClose').addEventListener('click',closeAdminPanel);
 adminPanelOverlay.addEventListener('click',function(e){if(e.target===adminPanelOverlay)closeAdminPanel();});
 document.getElementById('adminLogoutBtn').addEventListener('click',function(){
   DB.signOut().then(function(){
-    setAdminSession(null);
+    setAdminSession(false);
     closeAdminPanel();
   });
 });
@@ -2857,7 +2948,13 @@ async function bootstrapApp(){
       }
     }
 
-    setAdminSession(session);
+    /* pulihkan login: ada session saja TIDAK cukup — wajib lolos pengecekan admin_users */
+    setAdminSession(false);
+    if(session){
+      try{await DB.verifyAdmin();setAdminSession(true);}
+      catch(e){console.warn('Verifikasi admin gagal:',e);setAdminSession(false);}
+    }
+    bindAuthListener();
 
     renderMenu();
     renderEvents();
